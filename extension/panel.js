@@ -717,8 +717,8 @@ function exportHot() {
 }
 
 // ================= 找词：web.cafe 新词发现服务的基础词 =================
-// 取「长期大词」整页（602 个，含老词 / 无标签 / 二次爆火 / 新词标签）和「二次爆火」两组（用户 10-12 定），
-// 按方向分；每个词照样显示它自己在 web.cafe 的标签。点词跳 sim 的 SERP 市场参与者页。
+// 取「长期大词」和「二次爆火」两组（用户 10-12 定），按方向分；
+// 每个词照样显示它自己在 web.cafe 的标签。点词跳 sim 的 SERP 市场参与者页。
 
 const WEBCAFE = 'https://new.web.cafe';
 const WC_TABS = { evergreen: '长期大词', resurgence: '二次爆火' };
@@ -727,12 +727,33 @@ const WC_DIRS = ['AI', '工具', '游戏', '其它'];
 const WC_TTL = 12 * 3600 * 1000;  // 缓存 12 小时；web.cafe 每天扫几批
 const W = { status: 'idle', items: [], q: '', dir: 'all', group: 'all' };
 
-// 拉 web.cafe 列表页（服务端渲染的 HTML）并解析卡片。要能整段塞进 executeScript，所以不引用外面任何东西
+// 拉 web.cafe 列表页（服务端渲染的 HTML）并解析卡片。要能整段塞进 executeScript，所以不引用外面任何东西。
+// 2026-11 改版后：每行是 <li>，详情链接是只盖住整行的空 <a>（关键词在 aria-label 和兄弟节点里），
+// 分页也从「第 x / y 页」变成「跳到 [ ] / y 页」。新旧两种结构都认。
 async function webcafeFetchAll(tabs, maxPages = 60) {
   const DIRS = ['AI', '工具', '游戏', '其它'];
-  const TAGS = ['老词', '二次爆火', '新词', '推荐过', '上升中', '回落中', '高位', '小游戏'];
+  const TAGS = ['老词', '二次爆火', '新词', '长期大词', '推荐过', '观察中', '短暂尖峰', '上升中', '回落中', '高位', '小游戏'];
   const VERD = ['值得做', '可以试试', '还没判断', '不值得做'];
   const items = []; const meta = {};
+  let reason = '';
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const num = (leaves) => {
+    const gi = leaves.indexOf('GPTs');
+    return (gi >= 0 && (leaves[gi + 1] || '').match(/^[×x]\s*([\d.]+)$/)) ||
+      leaves.map((l) => l.match(/^GPTs\s*[×x]\s*([\d.]+)$/)).find(Boolean) ||
+      leaves.map((l) => l.match(/^[×x]\s*([\d.]+)$/)).find(Boolean);
+  };
+  // 方向、标签、判断、GPTs 倍数、描述：新旧页面都从这一行的文字节点里认
+  const fields = (leaves, kw) => {
+    const g = num(leaves);
+    return {
+      dir: DIRS.find((d) => leaves.slice(0, 8).includes(d)) || '其它',
+      tags: TAGS.filter((t) => leaves.includes(t)),
+      verdict: VERD.find((v) => leaves.includes(v)) || '',
+      gpts: g ? +g[1] : null,
+      desc: leaves.find((l) => l !== kw && l.length >= 12 && !/爆发|出现|自身近|内页候选|专门页面|复制|这个词怎么做/.test(l)) || '',
+    };
+  };
   for (const tab of tabs) {
     let page = 1, pages = 1;
     do {
@@ -740,33 +761,62 @@ async function webcafeFetchAll(tabs, maxPages = 60) {
       if (!r.ok) throw new Error(`web.cafe HTTP ${r.status}`);
       const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
       const main = doc.querySelector('main');
-      if (!main) break;
-      const pm = main.textContent.match(/第\s*(\d+)\s*\/\s*(\d+)\s*页/);
-      pages = pm ? +pm[2] : page;
-      if (page === 1) { const f = main.textContent.match(/找到\s*([\d,]+)\s*个/); meta[tab] = { found: f ? +f[1].replace(/,/g, '') : null, pages }; }
-      for (const a of main.querySelectorAll('a[href^="/keywords/"]')) {
-        const leaves = [...a.querySelectorAll('*')].filter((e) => !e.children.length).map((e) => e.textContent.trim()).filter(Boolean);
+      if (!main) { reason = 'markup'; break; }
+      const mainText = norm(main.textContent);
+      // 旧：「第 1 / 266 页」；新：「跳到 [ ] / 266 页」，页码输入框的 max 也写了总页数
+      const pm = mainText.match(/第\s*(\d+)\s*\/\s*(\d+)\s*页/) || mainText.match(/\/\s*(\d+)\s*页/);
+      const pageInput = main.querySelector('input[name="page"]');
+      const max = pageInput ? Number(pageInput.getAttribute('max')) : 0;
+      pages = max > 0 ? max : (pm ? +pm[pm.length - 1] : page);
+      if (page === 1) {
+        const f = mainText.match(/找到\s*([\d,]+)\s*个/);
+        meta[tab] = { found: f ? +f[1].replace(/,/g, '') : null, pages };
+      }
+      const seen = new Set();
+      const links = 'a[href^="/keywords/"], a[href^="/zh/keywords/"]';
+      // 旧版：链接里面就是整张卡片的文字
+      for (const a of main.querySelectorAll(links)) {
+        const leaves = [...a.querySelectorAll('*')].filter((e) => !e.children.length).map((e) => norm(e.textContent)).filter(Boolean);
         if (!leaves.length) continue;
-        const gi = leaves.indexOf('GPTs');
-        const g = (gi >= 0 && (leaves[gi + 1] || '').match(/^×\s*([\d.]+)$/)) || leaves.map((l) => l.match(/^GPTs\s*×\s*([\d.]+)$/)).find(Boolean);
-        items.push({ kw: leaves[0], tab, dir: DIRS.find((d) => leaves.slice(1, 3).includes(d)) || '其它',
-          tags: TAGS.filter((t) => leaves.includes(t)), verdict: VERD.find((v) => leaves.includes(v)) || '',
-          gpts: g ? +g[1] : null, desc: leaves.find((l, i) => i > 0 && l.length >= 12 && !/爆发|出现|自身近/.test(l)) || '',
-          slug: a.getAttribute('href').split('?')[0] });
+        const kw = leaves[0];
+        if (seen.has(kw)) continue;
+        seen.add(kw);
+        items.push({ kw, tab, ...fields(leaves, kw), slug: (a.getAttribute('href') || '').split('?')[0] });
+      }
+      // 新版：每行一个 li，详情链接是空的覆盖层，关键词写在 aria-label 里
+      for (const li of main.querySelectorAll('li')) {
+        const anchors = [...li.querySelectorAll(links)];
+        const detail = anchors.find((x) => /^查看关键词/.test(x.getAttribute('aria-label') || ''));
+        const btn = li.querySelector('button[aria-label$="，详情同步中"]');
+        const kw = norm(detail?.getAttribute('aria-label') || btn?.getAttribute('aria-label') || '')
+          .replace(/^查看关键词\s*/, '').replace(/，详情同步中$/, '').trim();
+        if (!kw || seen.has(kw)) continue;
+        const leaves = [...li.querySelectorAll('*')].filter((e) => !e.children.length).map((e) => norm(e.textContent)).filter(Boolean);
+        seen.add(kw);
+        items.push({ kw, tab, ...fields(leaves, kw), slug: detail ? (detail.getAttribute('href') || '').split('?')[0] : '' });
+      }
+      // 一条都没解析到：把页面自己说的话记下来，别一律当成「没登录」
+      if (page === 1 && !items.length) {
+        if (/还没有解锁任何月份的数据|解锁之后.{0,4}看|解锁之后就能看/.test(mainText)) reason = 'locked';
+        else if (/请先登录|登录后需绑定微信/.test(mainText)) reason = 'login';
+        else if (/关键词库暂时打不开/.test(mainText)) reason = 'server';
+        else if (/没有符合条件的词|这一栏暂时是空的/.test(mainText)) reason = 'empty';
+        else reason = 'markup';
       }
       page++;
       await new Promise((res) => setTimeout(res, 250));
     } while (page <= pages && page <= maxPages);
   }
-  return { items, meta };
+  return { items, meta, reason };
 }
 
 // 侧边栏直接请求（带你在 Chrome 里的 web.cafe 登录）；拿不到就借一个 web.cafe 标签页在页面里请求
 async function fetchWebcafe() {
   const tabs = Object.keys(WC_TABS);
+  let direct = null;
   try {
-    const r = await webcafeFetchAll(tabs);
-    if (r.items.length) return r;
+    direct = await webcafeFetchAll(tabs);
+    if (direct.items.length) return direct;
   } catch (e) { console.warn('web.cafe 直接请求失败', e); }
   let [tab] = await chrome.tabs.query({ url: `${WEBCAFE}/*` });
   let made = null;
@@ -781,10 +831,26 @@ async function fetchWebcafe() {
   }
   try {
     const [{ result }] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: webcafeFetchAll, args: [tabs] });
-    return result;
+    // 页面里有登录态，它的判断比侧边栏直接请求更准
+    if (result?.items?.length) return result;
+    return result || direct || { items: [], meta: {}, reason: 'markup' };
+  } catch (e) {
+    if (direct) return direct;
+    throw e;
   } finally {
     if (made) chrome.tabs.remove(made.id).catch(() => {});
   }
+}
+
+// 抓不到词时把原因说清楚：登录、没解锁数据月份、页面改版、确实没有结果
+function wcReason(reason) {
+  return {
+    locked: 'web.cafe 没返回词：可能没登录，或账号还没解锁数据月份',
+    login: '没登录 web.cafe',
+    markup: 'web.cafe 页面改版了，插件暂时解析不到词',
+    server: 'web.cafe 的关键词库暂时打不开',
+    empty: 'web.cafe 这一栏没有词（可能是筛选条件太窄）',
+  }[reason] || '没从 web.cafe 拿到词';
 }
 
 // 同一个词可能两组都有：合成一条，记下属于哪些组
@@ -828,8 +894,11 @@ async function loadWords({ force = false } = {}) {
       const items = mergeWords(r.items);
       Object.assign(W, { status: 'done', items, meta: r.meta, at: Date.now() });
       chrome.storage.local.set({ [WC_CACHE]: { items, meta: r.meta, at: W.at } }).catch(() => {});
-    } else if (W.items.length) W.err = new Error('没登录 web.cafe');
-    else W.status = 'login';
+    } else {
+      const why = wcReason(r?.reason);
+      if (W.items.length) W.err = new Error(why);
+      else Object.assign(W, { status: r?.reason === 'login' ? 'login' : 'error', err: new Error(why) });
+    }
   } catch (e) {
     if (W.items.length) W.err = e;
     else Object.assign(W, { status: 'error', err: e });
@@ -856,7 +925,7 @@ function wordRow(w, i) {
       <a class="ext trends" href="${esc(trendsUrl(w.kw))}" title="Google Trends 近 1 个月，和 ${TRENDS_BASE} 对比">Trends</a></div>
     <span class="c-gpts" title="近 7 天热度是 gpts 的多少倍（web.cafe 口径）">${fmtGpts(w.gpts)}</span>
     <div class="kwmeta">${metaLine([...w.tags.filter((t) => !w.groups.includes(t)).map(esc), esc(w.verdict),
-      `<a class="ext" href="${esc(WEBCAFE + w.slug)}" title="在 web.cafe 看这个词的判断和 SERP">web.cafe ›</a>`])}</div></div>`;
+      w.slug ? `<a class="ext" href="${esc(WEBCAFE + w.slug)}" title="在 web.cafe 看这个词的判断和 SERP">web.cafe ›</a>` : ''])}</div></div>`;
 }
 
 // 只重画列表（打字时用，搜索框不丢焦点）
@@ -876,9 +945,11 @@ function renderWords() {
     return;
   }
   if (W.status === 'login' || (W.status === 'error' && !W.items.length)) {
+    const why = W.err?.message || '没登录 web.cafe';
     view.innerHTML = `<div class="list"><section class="card err"><h2>${ICON_ALERT}没从 web.cafe 拿到数据</h2>
-      <p>${W.status === 'login' ? '多半是没登录，或账号没有「数据服务」权限。' : esc(W.err?.message)}先在 Chrome 里打开 web.cafe 登录，回到这里会自动再试。</p>
-      <div class="btns start"><a class="btn primary ext" href="${WEBCAFE}/keywords?tab=evergreen">打开 web.cafe 登录</a>
+      <p>${esc(why)}。</p>
+      <p>先在 Chrome 里打开 web.cafe 的关键词页，确认已经登录、页面上能看见词；回到这里会自动再试。</p>
+      <div class="btns start"><a class="btn primary ext" href="${WEBCAFE}/keywords?tab=evergreen">打开 web.cafe</a>
       <button class="btn" type="button" data-act="w-refresh">重新读取</button></div></section></div>`;
     return;
   }

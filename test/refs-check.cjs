@@ -285,6 +285,9 @@ const CASES = {
   async '四轮#4 查域名查询中打字：字不被冲掉'(p) {
     await p.evaluate(() => { window.__lookupDelay = 150; });
     await p.click('#tab-names');
+    // 打开时如果当前页是 sim 关键词页，面板会先 probeHot；等它画完再输入，
+    // 免得刚填的字被后台重画换掉
+    await until(p, () => S.view === 'names' && H.status !== 'probing');
     await p.fill('[data-act=n-input]', 'pdf to jpg');
     await p.press('[data-act=n-input]', 'Enter');
     await until(p, () => N.status === 'running' && N.done > 0);
@@ -294,7 +297,7 @@ const CASES = {
     return [r.value === 'merge pdf' && r.q === 'pdf to jpg', r];
   },
   async '固化数据：本地没有时找站直接用项目里带的那份，不去拉'(p) {
-    await p.evaluate(() => { window.__useSeed = true; });
+    await p.evaluate(() => { window.__useSeed = true; window.__seedAt = Date.now(); });
     await p.click('#tab-refs');
     await until(p, () => R.status === 'done' && !refJob);
     const s = await state(p);
@@ -317,6 +320,30 @@ const CASES = {
     await until(p, () => W.items.length > 0 && !W.refreshing);
     const r = await p.evaluate(() => ({ rows: document.querySelectorAll('#wlist .hrow').length, meta: document.querySelector('.status .meta')?.textContent || '', card: !!document.querySelector('.card.err') }));
     return [r.rows === 1 && /更新失败/.test(r.meta) && !r.card, r];
+  },
+  async '找词：web.cafe 新版页面（空覆盖链接、/ N 页）也能解析'(p) {
+    await p.evaluate(() => { window.__wcNewMarkup = true; });
+    await p.click('#tab-words');
+    await until(p, () => W.status === 'done' && !W.refreshing && W.items.length === 5, null, 60000);
+    const r = await p.evaluate(() => ({
+      n: W.items.length,
+      items: W.items.map((x) => ({ kw: x.kw, dir: x.dir, tags: x.tags, verdict: x.verdict, gpts: x.gpts, slug: x.slug })),
+      rows: document.querySelectorAll('#wlist .hrow').length,
+      meta: W.meta,
+    }));
+    const pdf = r.items.find((x) => x.kw === 'pdf to jpg');
+    const lagos = r.items.find((x) => x.kw === 'lagos life');
+    return [r.n === 5 && r.rows === 5,
+      pdf?.dir === '工具' && pdf.tags.includes('老词') && pdf.tags.includes('上升中') && pdf.verdict === '可以试试' && pdf.gpts === 8.4 && pdf.slug === '/keywords/pdf-to-jpg',
+      lagos?.dir === '游戏' && lagos.gpts === 460,
+      r.meta.evergreen?.found === 3 && r.meta.evergreen?.pages === 2, r];
+  },
+  async '找词：没解锁数据月份时给出具体原因，不说成没登录'(p) {
+    await p.evaluate(() => { window.__wcLocked = true; });
+    await p.click('#tab-words');
+    await until(p, () => W.status === 'error' && !W.refreshing, null, 60000);
+    const r = await p.evaluate(() => ({ status: W.status, msg: W.err?.message || '', card: document.querySelector('.card.err')?.innerText || '' }));
+    return [r.status === 'error' && /没解锁数据月份/.test(r.msg) && /没解锁数据月份/.test(r.card), r];
   },
   async '#8 同一个侧边栏开着跨过 30 天：自动更新一次'(p) {
     await p.evaluate(() => window.__seedRefCache(5));

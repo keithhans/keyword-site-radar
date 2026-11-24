@@ -96,6 +96,7 @@
   // 项目里带的那份数据（extension/seed/）：默认不给（测试从「本地没有」开始），__useSeed=true 才给
   const nativeFetch = (() => { const f = document.createElement('iframe'); f.style.display = 'none'; document.body.appendChild(f); return f.contentWindow.fetch.bind(f.contentWindow); })();
   window.__useSeed = false;
+  window.__seedAt = 0;  // >0：把种子数据的拉取时间改成这个值（测「带的那份还没满 30 天」）
   chrome.runtime.getURL = (p) => (window.__useSeed ? new URL('../extension/' + p, location.href).href : 'about:noseed/' + p);
   // 本机服务在找站这边的两个接口：/normalize 把主机名归到可注册域名（够用的简化版公共后缀），
   // /lookup 给确定的假注册日；cachedOnly 只回一半（假装另一半还没查过），没查过的单个查要 20ms
@@ -108,7 +109,13 @@
   window.__lookups = { cachedOnly: 0, single: 0 };
   const prevFetch = window.fetch;
   window.fetch = async (u, opts) => {
-    if (typeof u === 'string' && u.includes('/extension/seed/')) return nativeFetch(u);
+    if (typeof u === 'string' && u.includes('/extension/seed/')) {
+      const r = await nativeFetch(u);
+      if (!window.__seedAt) return r;
+      const d = await r.json();
+      d.at = window.__seedAt;
+      return { ok: true, status: 200, json: async () => d };
+    }
     const path = new URL(u, location.href).pathname;
     const body = opts?.body ? JSON.parse(opts.body) : {};
     if (path === '/normalize' && body.hosts?.some((x) => /^site\d+\.com$/.test(x.h))) {  // 只接找站那批（域名视图照旧走 stub.js）
